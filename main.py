@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, Any
@@ -8,6 +9,7 @@ import sqlite3, hashlib, os, secrets, json, hmac
 
 DB_PATH = Path(__file__).with_name("nutrition_app.db")
 PBKDF2_ROUNDS = 210_000
+security = HTTPBearer(auto_error=False)
 
 app = FastAPI(title="Nutrición a tu alcance API", version="0.1.0")
 app.add_middleware(
@@ -120,6 +122,15 @@ def require_user(authorization: str | None):
         raise HTTPException(401, "Sesión expirada")
     return row
 
+def current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security)
+):
+    if credentials is None:
+        raise HTTPException(401, "Falta token de acceso")
+
+    authorization = f"{credentials.scheme} {credentials.credentials}"
+    return require_user(authorization)
+
 class RegisterIn(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     email: EmailStr
@@ -175,8 +186,7 @@ def login(data: LoginIn):
     return {"token":issue_token(row["id"]), "user":{"id":row["id"],"name":row["name"],"email":row["email"]}}
 
 @app.get("/me")
-def me(authorization: str | None = Header(default=None)):
-    u=require_user(authorization)
+def me(u = Depends(current_user)):
     return {"id":u["id"],"name":u["name"],"email":u["email"]}
 
 @app.get("/profile")
