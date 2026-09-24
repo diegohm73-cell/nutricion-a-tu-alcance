@@ -5,13 +5,15 @@ from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, Any
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import sqlite3, hashlib, os, secrets, json, hmac
+from openai import OpenAI
+import sqlite3, hashlib, os, secrets, json, hmac, re
 
 DB_PATH = Path(__file__).with_name("nutrition_app.db")
 PBKDF2_ROUNDS = 210_000
 security = HTTPBearer(auto_error=False)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
 
-app = FastAPI(title="Nutrición a tu alcance API", version="0.1.0")
+app = FastAPI(title="Nutrición a tu alcance API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # restringir en producción al dominio real
@@ -159,6 +161,129 @@ class TrackingIn(BaseModel):
     adherence: int = Field(ge=1, le=5)
     date: Optional[str] = None
 
+class MenuGenerateIn(BaseModel):
+    goal: str = Field(min_length=2, max_length=120)
+    days: int = Field(default=1, ge=1, le=7)
+    kcal: Optional[int] = Field(default=None, ge=800, le=6000)
+    meals: int = Field(default=5, ge=3, le=6)
+    profile: dict[str, Any] = Field(default_factory=dict)
+    clinical: dict[str, Any] = Field(default_factory=dict)
+    preferences: dict[str, Any] = Field(default_factory=dict)
+    model_config = {"extra":"allow"}
+
+NUTRITION_SYSTEM_PROMPT = """
+Eres el motor de generación de menús de la aplicación mexicana "Nutrición a tu alcance".
+Tu tarea es crear un menú práctico, realista y clínicamente prudente a partir de los datos
+proporcionados por el usuario.
+
+REGLAS OBLIGATORIAS
+1. Usa el Sistema Mexicano de Alimentos Equivalentes (SMAE) como marco para calcular cantidades y equivalentes.
+2. Todas las porciones deben ser explícitas en unidades domésticas y/o gramos, piezas, mililitros o cucharadas.
+3. Cuantifica también verduras, grasas y semillas.
+4. Prioriza alimentos reales, accesibles en México y combinaciones culinarias plausibles.
+5. Evita menús monótonos y evita acumular varios cereales principales en una misma comida salvo justificación nutricional.
+6. Ajusta el menú al objetivo: pérdida de grasa, mantenimiento, ganancia muscular o mejora de hábitos.
+7. No uses déficits energéticos agresivos. En menores de 18 años prioriza crecimiento y supervisión profesional.
+8. En diabetes tipo 2 distribuye carbohidratos, fibra y proteína; no indiques cambios de dosis de insulina ni medicamentos.
+9. En reflujo/gastritis, colon irritable o EII adapta según tolerancia individual sin asumir desencadenantes universales.
+10. En cirugía bariátrica respeta estrictamente la fase indicada. Si falta la fase, advierte que debe confirmarse antes de usar el menú.
+11. Respeta alergias, intolerancias, alimentos rechazados, cultura, presupuesto y horarios.
+12. No diagnostiques enfermedades, no prometas resultados y no sustituyas valoración médica.
+13. Si faltan datos clínicos, genera un ejemplo prudente y señala claramente qué debe confirmarse.
+14. Si se proporciona un objetivo energético, intenta aproximarte a él y mantén coherencia entre las comidas.
+15. El número de días y comidas debe coincidir exactamente con lo solicitado.
+16. Devuelve SOLO JSON válido, sin Markdown ni texto antes o después.
+
+FORMATO JSON OBLIGATORIO
+{
+  "title": "string",
+  "goal": "string",
+  "target_kcal": 0,
+  "disclaimer": "string",
+  "clinical_notes": ["string"],
+  "smae_notes": ["string"],
+  "days": [
+    {
+      "day": 1,
+      "estimated_kcal": 0,
+      "meals": [
+        {
+          "name": "Desayuno",
+          "time": "08:00",
+          "dish": "string",
+          "ingredients": [
+            {
+              "food": "string",
+              "amount": "string",
+              "smae_group": "string",
+              "equivalents": "string"
+            }
+          ],
+          "instructions": "string",
+          "estimated_kcal": 0
+        }
+      ],
+      "daily_notes": ["string"]
+    }
+  ]
+}
+"""
+
+def extract_json_object(text: str):
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end+1])
+        raise
+
+def build_menu_prompt(data: MenuGenerateIn):
+    return (
+        "Genera el menú solicitado usando estrictamente las reglas del sistema. "
+        "Datos recibidos:\n" +
+        json.dumps(data.model_dump(), ensure_ascii=False, indent=2)
+    )
+
+def generate_menu_with_ai(data: MenuGenerateIn):
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            503,
+            "El generador no está configurado: falta OPENAI_API_KEY en el servidor"
+        )
+
+    client = OpenAI(api_key=api_key)
+    try:
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=NUTRITION_SYSTEM_PROMPT,
+            input=build_menu_prompt(data),
+            max_output_tokens=8000,
+        )
+        menu = extract_json_object(response.output_text)
+    except json.JSONDecodeError:
+        raise HTTPException(502, "El modelo devolvió un menú con formato inválido")
+    except Exception as exc:
+        raise HTTPException(502, f"No fue posible generar el menú: {type(exc).__name__}")
+
+    if not isinstance(menu, dict) or not isinstance(menu.get("days"), list):
+        raise HTTPException(502, "La respuesta del generador no contiene un menú válido")
+    if len(menu["days"]) != data.days:
+        raise HTTPException(502, "El generador devolvió un número de días distinto al solicitado")
+
+    for day in menu["days"]:
+        meals = day.get("meals")
+        if not isinstance(meals, list) or len(meals) != data.meals:
+            raise HTTPException(502, "El generador devolvió un número de comidas distinto al solicitado")
+
+    return menu
+
 @app.get("/health")
 def health():
     return {"ok": True, "service": "nutricion-a-tu-alcance-api"}
@@ -205,6 +330,55 @@ def put_profile(data: ProfileIn, authorization: str | None = Header(default=None
                      ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
                   (u["id"],payload,now_iso()))
     return {"ok":True}
+
+@app.post("/menus/generate")
+def generate_menu(data: MenuGenerateIn, authorization: str | None = Header(default=None)):
+    u = require_user(authorization)
+
+    with conn() as c:
+        sub = c.execute(
+            "SELECT plan,status FROM subscriptions WHERE user_id=?",
+            (u["id"],)
+        ).fetchone()
+
+    plan = sub["plan"] if sub else "free"
+    status = sub["status"] if sub else "active"
+
+    if status != "active":
+        raise HTTPException(403, "La suscripción no está activa")
+    if plan == "free" and data.days != 1:
+        raise HTTPException(403, "La prueba gratuita permite generar un menú de 1 día")
+    if plan in {"monthly","annual"} and data.days > 7:
+        raise HTTPException(400, "La versión premium admite hasta 7 días por menú")
+
+    menu = generate_menu_with_ai(data)
+    title = str(menu.get("title") or "Plan generado")
+    target_kcal = menu.get("target_kcal") or data.kcal
+
+    stored_payload = {
+        "_generated_by": "ai",
+        "_model": OPENAI_MODEL,
+        "_request": data.model_dump(),
+        "menu": menu,
+    }
+
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO menus(user_id,title,goal,kcal,protein,meals,payload,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                u["id"],
+                title,
+                data.goal,
+                target_kcal,
+                None,
+                data.meals,
+                json.dumps(stored_payload, ensure_ascii=False),
+                now_iso(),
+            )
+        )
+
+    return {"id": cur.lastrowid, "ok": True, "menu": menu}
 
 @app.post("/menus")
 def create_menu(data: MenuIn, authorization: str | None = Header(default=None)):
