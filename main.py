@@ -351,15 +351,13 @@ def me(u = Depends(current_user)):
     return {"id":u["id"],"name":u["name"],"email":u["email"]}
 
 @app.get("/profile")
-def get_profile(authorization: str | None = Header(default=None)):
-    u=require_user(authorization)
+def get_profile(u = Depends(current_user)):
     with conn() as c:
         row=c.execute("SELECT payload,updated_at FROM profiles WHERE user_id=?",(u["id"],)).fetchone()
     return {"profile": json.loads(row["payload"]) if row else None, "updated_at": row["updated_at"] if row else None}
 
 @app.put("/profile")
-def put_profile(data: ProfileIn, authorization: str | None = Header(default=None)):
-    u=require_user(authorization)
+def put_profile(data: ProfileIn, u = Depends(current_user)):
     payload=json.dumps(data.model_dump(),ensure_ascii=False)
     with conn() as c:
         c.execute("""INSERT INTO profiles(user_id,payload,updated_at) VALUES(?,?,?)
@@ -368,8 +366,7 @@ def put_profile(data: ProfileIn, authorization: str | None = Header(default=None
     return {"ok":True}
 
 @app.post("/menus/generate")
-def generate_menu(data: MenuGenerateIn, authorization: str | None = Header(default=None)):
-    u = require_user(authorization)
+def generate_menu(data: MenuGenerateIn, u = Depends(current_user)):
 
     with conn() as c:
         sub = c.execute(
@@ -417,8 +414,7 @@ def generate_menu(data: MenuGenerateIn, authorization: str | None = Header(defau
     return {"id": cur.lastrowid, "ok": True, "menu": menu}
 
 @app.post("/menus")
-def create_menu(data: MenuIn, authorization: str | None = Header(default=None)):
-    u=require_user(authorization)
+def create_menu(data: MenuIn, u = Depends(current_user)):
     with conn() as c:
         cur=c.execute("""INSERT INTO menus(user_id,title,goal,kcal,protein,meals,payload,created_at)
                          VALUES(?,?,?,?,?,?,?,?)""",
@@ -427,8 +423,7 @@ def create_menu(data: MenuIn, authorization: str | None = Header(default=None)):
     return {"id":cur.lastrowid,"ok":True}
 
 @app.get("/menus")
-def list_menus(authorization: str | None = Header(default=None), limit: int = 30):
-    u=require_user(authorization)
+def list_menus(limit: int = 30, u = Depends(current_user)):
     limit=max(1,min(limit,100))
     with conn() as c:
         rows=c.execute("""SELECT id,title,goal,kcal,protein,meals,payload,created_at
@@ -436,8 +431,7 @@ def list_menus(authorization: str | None = Header(default=None), limit: int = 30
     return {"items":[{**dict(r),"payload":json.loads(r["payload"])} for r in rows]}
 
 @app.post("/tracking")
-def create_tracking(data: TrackingIn, authorization: str | None = Header(default=None)):
-    u=require_user(authorization)
+def create_tracking(data: TrackingIn, u = Depends(current_user)):
     created=data.date or now_iso()
     with conn() as c:
         cur=c.execute("""INSERT INTO tracking(user_id,energy,hunger,sleep,digestion,adherence,created_at)
@@ -446,8 +440,7 @@ def create_tracking(data: TrackingIn, authorization: str | None = Header(default
     return {"id":cur.lastrowid,"ok":True}
 
 @app.get("/tracking")
-def list_tracking(authorization: str | None = Header(default=None), limit: int = 52):
-    u=require_user(authorization)
+def list_tracking(limit: int = 52, u = Depends(current_user)):
     limit=max(1,min(limit,104))
     with conn() as c:
         rows=c.execute("""SELECT id,energy,hunger,sleep,digestion,adherence,created_at
@@ -455,16 +448,14 @@ def list_tracking(authorization: str | None = Header(default=None), limit: int =
     return {"items":[dict(r) for r in rows]}
 
 @app.get("/subscription")
-def subscription(authorization: str | None = Header(default=None)):
-    u=require_user(authorization)
+def subscription(u = Depends(current_user)):
     with conn() as c:
         row=c.execute("SELECT * FROM subscriptions WHERE user_id=?",(u["id"],)).fetchone()
     return dict(row) if row else {"plan":"free","status":"active"}
 
 @app.post("/subscription/mock")
-def mock_subscription(plan: str = "monthly", authorization: str | None = Header(default=None)):
+def mock_subscription(plan: str = "monthly", u = Depends(current_user)):
     # Solo para desarrollo. Eliminar al conectar pagos reales.
-    u=require_user(authorization)
     if plan not in {"monthly","annual","free"}:
         raise HTTPException(400,"Plan inválido")
     with conn() as c:
