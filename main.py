@@ -6,12 +6,17 @@ from typing import Optional, Any
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from openai import OpenAI
-import sqlite3, hashlib, os, secrets, json, hmac, re
+import sqlite3, hashlib, os, secrets, json, hmac, re, base64
 
 DB_PATH = Path(__file__).with_name("nutrition_app.db")
 PBKDF2_ROUNDS = 210_000
 security = HTTPBearer(auto_error=False)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+
+# Para pruebas, si AUTH_SECRET no existe se deriva de OPENAI_API_KEY.
+# En producción conviene definir AUTH_SECRET como variable independiente en Render.
+_raw_auth_secret = os.getenv("AUTH_SECRET") or ("auth:" + (os.getenv("OPENAI_API_KEY") or ""))
+AUTH_SECRET = hashlib.sha256(_raw_auth_secret.encode()).digest()
 
 app = FastAPI(title="Nutrición a tu alcance API", version="0.2.0")
 app.add_middleware(
@@ -101,27 +106,58 @@ def verify_password(password: str, digest_hex: str, salt_hex: str):
     check, _ = hash_password(password, salt_hex)
     return hmac.compare_digest(check, digest_hex)
 
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
 def issue_token(user_id: int):
-    token = secrets.token_urlsafe(32)
-    expires = datetime.now(timezone.utc) + timedelta(days=30)
-    with conn() as c:
-        c.execute("INSERT INTO sessions(token,user_id,expires_at,created_at) VALUES(?,?,?,?)",
-                  (token,user_id,expires.isoformat(),now_iso()))
-    return token
+    now = int(datetime.now(timezone.utc).timestamp())
+    payload = {
+        "uid": int(user_id),
+        "iat": now,
+        "exp": now + 30 * 24 * 60 * 60
+    }
+    body = _b64url_encode(
+        json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    )
+    signature = _b64url_encode(
+        hmac.new(AUTH_SECRET, body.encode(), hashlib.sha256).digest()
+    )
+    return f"{body}.{signature}"
 
 def require_user(authorization: str | None):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Falta token de acceso")
-    token = authorization.split(" ",1)[1].strip()
-    with conn() as c:
-        row = c.execute("""
-            SELECT u.* , s.expires_at FROM sessions s
-            JOIN users u ON u.id=s.user_id WHERE s.token=?
-        """,(token,)).fetchone()
-    if not row:
+
+    token = authorization.split(" ", 1)[1].strip()
+
+    try:
+        body, signature = token.split(".", 1)
+        expected = _b64url_encode(
+            hmac.new(AUTH_SECRET, body.encode(), hashlib.sha256).digest()
+        )
+        if not hmac.compare_digest(signature, expected):
+            raise HTTPException(401, "Sesión inválida")
+
+        payload = json.loads(_b64url_decode(body).decode())
+        if int(payload.get("exp", 0)) < int(datetime.now(timezone.utc).timestamp()):
+            raise HTTPException(401, "Sesión expirada")
+
+        user_id = int(payload["uid"])
+    except HTTPException:
+        raise
+    except Exception:
         raise HTTPException(401, "Sesión inválida")
-    if datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
-        raise HTTPException(401, "Sesión expirada")
+
+    with conn() as c:
+        row = c.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+
+    if not row:
+        raise HTTPException(401, "Usuario no encontrado")
+
     return row
 
 def current_user(
@@ -315,13 +351,15 @@ def me(u = Depends(current_user)):
     return {"id":u["id"],"name":u["name"],"email":u["email"]}
 
 @app.get("/profile")
-def get_profile(u = Depends(current_user)):
+def get_profile(authorization: str | None = Header(default=None)):
+    u=require_user(authorization)
     with conn() as c:
         row=c.execute("SELECT payload,updated_at FROM profiles WHERE user_id=?",(u["id"],)).fetchone()
     return {"profile": json.loads(row["payload"]) if row else None, "updated_at": row["updated_at"] if row else None}
 
 @app.put("/profile")
-def put_profile(data: ProfileIn, u = Depends(current_user)):
+def put_profile(data: ProfileIn, authorization: str | None = Header(default=None)):
+    u=require_user(authorization)
     payload=json.dumps(data.model_dump(),ensure_ascii=False)
     with conn() as c:
         c.execute("""INSERT INTO profiles(user_id,payload,updated_at) VALUES(?,?,?)
@@ -330,7 +368,8 @@ def put_profile(data: ProfileIn, u = Depends(current_user)):
     return {"ok":True}
 
 @app.post("/menus/generate")
-def generate_menu(data: MenuGenerateIn, u = Depends(current_user)):
+def generate_menu(data: MenuGenerateIn, authorization: str | None = Header(default=None)):
+    u = require_user(authorization)
 
     with conn() as c:
         sub = c.execute(
@@ -378,7 +417,8 @@ def generate_menu(data: MenuGenerateIn, u = Depends(current_user)):
     return {"id": cur.lastrowid, "ok": True, "menu": menu}
 
 @app.post("/menus")
-def create_menu(data: MenuIn, u = Depends(current_user)):
+def create_menu(data: MenuIn, authorization: str | None = Header(default=None)):
+    u=require_user(authorization)
     with conn() as c:
         cur=c.execute("""INSERT INTO menus(user_id,title,goal,kcal,protein,meals,payload,created_at)
                          VALUES(?,?,?,?,?,?,?,?)""",
@@ -387,7 +427,8 @@ def create_menu(data: MenuIn, u = Depends(current_user)):
     return {"id":cur.lastrowid,"ok":True}
 
 @app.get("/menus")
-def list_menus(limit: int = 30, u = Depends(current_user)):
+def list_menus(authorization: str | None = Header(default=None), limit: int = 30):
+    u=require_user(authorization)
     limit=max(1,min(limit,100))
     with conn() as c:
         rows=c.execute("""SELECT id,title,goal,kcal,protein,meals,payload,created_at
@@ -395,7 +436,8 @@ def list_menus(limit: int = 30, u = Depends(current_user)):
     return {"items":[{**dict(r),"payload":json.loads(r["payload"])} for r in rows]}
 
 @app.post("/tracking")
-def create_tracking(data: TrackingIn, u = Depends(current_user)):
+def create_tracking(data: TrackingIn, authorization: str | None = Header(default=None)):
+    u=require_user(authorization)
     created=data.date or now_iso()
     with conn() as c:
         cur=c.execute("""INSERT INTO tracking(user_id,energy,hunger,sleep,digestion,adherence,created_at)
@@ -404,7 +446,8 @@ def create_tracking(data: TrackingIn, u = Depends(current_user)):
     return {"id":cur.lastrowid,"ok":True}
 
 @app.get("/tracking")
-def list_tracking(limit: int = 52, u = Depends(current_user)):
+def list_tracking(authorization: str | None = Header(default=None), limit: int = 52):
+    u=require_user(authorization)
     limit=max(1,min(limit,104))
     with conn() as c:
         rows=c.execute("""SELECT id,energy,hunger,sleep,digestion,adherence,created_at
@@ -412,14 +455,16 @@ def list_tracking(limit: int = 52, u = Depends(current_user)):
     return {"items":[dict(r) for r in rows]}
 
 @app.get("/subscription")
-def subscription(u = Depends(current_user)):
+def subscription(authorization: str | None = Header(default=None)):
+    u=require_user(authorization)
     with conn() as c:
         row=c.execute("SELECT * FROM subscriptions WHERE user_id=?",(u["id"],)).fetchone()
     return dict(row) if row else {"plan":"free","status":"active"}
 
 @app.post("/subscription/mock")
-def mock_subscription(plan: str = "monthly", u = Depends(current_user)):
+def mock_subscription(plan: str = "monthly", authorization: str | None = Header(default=None)):
     # Solo para desarrollo. Eliminar al conectar pagos reales.
+    u=require_user(authorization)
     if plan not in {"monthly","annual","free"}:
         raise HTTPException(400,"Plan inválido")
     with conn() as c:
