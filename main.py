@@ -12,6 +12,7 @@ DB_PATH = Path(__file__).with_name("nutrition_app.db")
 PBKDF2_ROUNDS = 210_000
 security = HTTPBearer(auto_error=False)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+SIMULATION_MODE = os.getenv("SIMULATION_MODE", "true").lower() in {"1","true","yes","on"}
 
 # Para pruebas, si AUTH_SECRET no existe se deriva de OPENAI_API_KEY.
 # En producción conviene definir AUTH_SECRET como variable independiente en Render.
@@ -286,7 +287,105 @@ def build_menu_prompt(data: MenuGenerateIn):
         json.dumps(data.model_dump(), ensure_ascii=False, indent=2)
     )
 
+
+def generate_mock_menu(data: MenuGenerateIn):
+    """Menú simulado para probar la app sin consumir la API de OpenAI."""
+    meal_names = ["Desayuno", "Colación matutina", "Comida", "Colación vespertina", "Cena"]
+    meal_times = ["08:00", "11:00", "14:30", "18:00", "21:00"]
+
+    base_meals = [
+        {
+            "dish": "Avena con yogur, frutos rojos y nuez",
+            "ingredients": [
+                {"food":"Avena en hojuelas","amount":"1/2 taza (40 g)","smae_group":"Cereales sin grasa","equivalents":"1"},
+                {"food":"Yogur natural sin azúcar","amount":"1 taza (240 ml)","smae_group":"Leche descremada","equivalents":"1"},
+                {"food":"Fresas","amount":"1 taza (150 g)","smae_group":"Frutas","equivalents":"1"},
+                {"food":"Nuez","amount":"3 piezas (9 g)","smae_group":"Grasas con proteína","equivalents":"1"}
+            ],
+            "instructions":"Mezclar la avena con el yogur y servir con fresas y nuez."
+        },
+        {
+            "dish": "Manzana con queso panela",
+            "ingredients": [
+                {"food":"Manzana","amount":"1 pieza mediana (140 g)","smae_group":"Frutas","equivalents":"1"},
+                {"food":"Queso panela","amount":"40 g","smae_group":"Alimentos de origen animal bajos en grasa","equivalents":"1"}
+            ],
+            "instructions":"Consumir la manzana fresca acompañada de queso panela."
+        },
+        {
+            "dish": "Pechuga de pollo con arroz, frijoles y ensalada",
+            "ingredients": [
+                {"food":"Pechuga de pollo asada","amount":"120 g","smae_group":"Alimentos de origen animal muy bajos en grasa","equivalents":"4"},
+                {"food":"Arroz cocido","amount":"3/4 taza (120 g)","smae_group":"Cereales sin grasa","equivalents":"2"},
+                {"food":"Frijoles de la olla","amount":"1/2 taza (85 g)","smae_group":"Leguminosas","equivalents":"1"},
+                {"food":"Lechuga, jitomate y pepino","amount":"2 tazas (180 g)","smae_group":"Verduras","equivalents":"2"},
+                {"food":"Aceite de oliva","amount":"2 cucharaditas (10 ml)","smae_group":"Grasas sin proteína","equivalents":"2"}
+            ],
+            "instructions":"Servir el pollo con arroz y frijoles; acompañar con ensalada y aceite de oliva."
+        },
+        {
+            "dish": "Yogur con plátano",
+            "ingredients": [
+                {"food":"Yogur griego natural sin azúcar","amount":"170 g","smae_group":"Leche descremada","equivalents":"1"},
+                {"food":"Plátano","amount":"1/2 pieza mediana (60 g)","smae_group":"Frutas","equivalents":"1"}
+            ],
+            "instructions":"Servir el yogur con el plátano en rebanadas."
+        },
+        {
+            "dish": "Tostadas de atún con aguacate y verduras",
+            "ingredients": [
+                {"food":"Atún en agua drenado","amount":"100 g","smae_group":"Alimentos de origen animal muy bajos en grasa","equivalents":"3"},
+                {"food":"Tostadas horneadas de maíz","amount":"3 piezas","smae_group":"Cereales sin grasa","equivalents":"3"},
+                {"food":"Aguacate","amount":"1/3 pieza (50 g)","smae_group":"Grasas sin proteína","equivalents":"2"},
+                {"food":"Jitomate, cebolla y lechuga","amount":"1.5 tazas (140 g)","smae_group":"Verduras","equivalents":"1.5"}
+            ],
+            "instructions":"Mezclar el atún con las verduras y servir sobre las tostadas con aguacate."
+        }
+    ]
+
+    kcal_total = data.kcal or 1800
+    requested_meals = max(3, min(data.meals, 5))
+    weights = [0.25, 0.10, 0.35, 0.10, 0.20][:requested_meals]
+    scale = sum(weights)
+    weights = [w / scale for w in weights]
+
+    days = []
+    for d in range(1, data.days + 1):
+        meals = []
+        for i in range(requested_meals):
+            item = base_meals[i]
+            meals.append({
+                "name": meal_names[i],
+                "time": meal_times[i],
+                "dish": item["dish"],
+                "ingredients": item["ingredients"],
+                "instructions": item["instructions"],
+                "estimated_kcal": round(kcal_total * weights[i])
+            })
+        days.append({
+            "day": d,
+            "estimated_kcal": kcal_total,
+            "meals": meals,
+            "daily_notes": [
+                "Menú de simulación para probar la aplicación.",
+                "Las cantidades se muestran con referencia al SMAE; validar clínicamente antes de uso real."
+            ]
+        })
+
+    return {
+        "title": f"Menú simulado - {data.goal}",
+        "goal": data.goal,
+        "target_kcal": kcal_total,
+        "disclaimer": "SIMULACIÓN: este menú es solo para probar el funcionamiento de la aplicación y no sustituye una valoración nutricional.",
+        "clinical_notes": ["Modo simulación activo: no se realizó ninguna llamada a OpenAI."],
+        "smae_notes": ["Porciones expresadas con grupos de equivalentes para validar la estructura de la app."],
+        "days": days
+    }
+
 def generate_menu_with_ai(data: MenuGenerateIn):
+    if SIMULATION_MODE:
+        return generate_mock_menu(data)
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise HTTPException(
